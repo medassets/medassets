@@ -1,59 +1,150 @@
-function formatRecommendations(recommendations) {
-    let html = '<div class="space-y-6">';
-    const query = elements.queryInput.value.trim();
+from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException
+from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse, JSONResponse
+import base64
+import requests
+import io
+from PIL import Image
+from dotenv import load_dotenv
+import os
+import logging
+import json
 
-    // Medications Section
-    if (recommendations.medications?.length > 0) {
-        html += `
-            <div class="medication-card p-4 rounded-xl border border-amber-500/20">
-                <h3 class="text-lg font-semibold text-amber-400 mb-3">
-                    💊 Medications for "${query}"
-                </h3>
-                <div class="space-y-4">
-                    ${recommendations.medications.map(med => `
-                        <div class="bg-gray-900/30 p-3 rounded-lg">
-                            <div class="font-medium text-white">${med.name}</div>
-                            ${med.dosage ? `<div class="text-sm text-amber-300">Dosage: ${med.dosage}</div>` : ''}
-                            ${med.purpose ? `<div class="text-sm text-gray-400 mt-1">Purpose: ${med.purpose}</div>` : ''}
-                        </div>
-                    `).join('')}
-                </div>
-            </div>`;
-    }
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    // Treatment Plan Section
-    if (recommendations.treatments?.length > 0) {
-        html += `
-            <div class="treatment-card p-4 rounded-xl border border-green-500/20 bg-green-900/10">
-                <h3 class="text-lg font-semibold text-green-400 mb-3">🏥 Treatment Plan</h3>
-                <ul class="list-disc pl-6 space-y-2 text-white">
-                    ${recommendations.treatments.map(t => `<li>${t}</li>`).join('')}
-                </ul>
-            </div>`;
-    }
+load_dotenv()
 
-    // Precautions Section
-    if (recommendations.precautions?.length > 0) {
-        html += `
-            <div class="precaution-card p-4 rounded-xl border border-red-500/20 bg-red-900/10">
-                <h3 class="text-lg font-semibold text-red-400 mb-3">⚠️ Precautions</h3>
-                <ul class="list-disc pl-6 space-y-2 text-white">
-                    ${recommendations.precautions.map(p => `<li>${p}</li>`).join('')}
-                </ul>
-            </div>`;
-    }
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
-    // Follow-Up Protocol Section
-    if (recommendations.follow_up?.length > 0) {
-        html += `
-            <div class="followup-card p-4 rounded-xl border border-blue-500/20 bg-blue-900/10">
-                <h3 class="text-lg font-semibold text-blue-400 mb-3">📅 Follow-Up Protocol</h3>
-                <ul class="list-disc pl-6 space-y-2 text-white">
-                    ${recommendations.follow_up.map(f => `<li>${f}</li>`).join('')}
-                </ul>
-            </div>`;
-    }
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-    html += '</div>';
-    return html;
-}
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is not set in the .env file")
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+def generate_recommendations(analysis_text: str) -> dict:
+    """Generate real-time medical recommendations using Groq API"""
+    recommendation_prompt = f"""
+    Analyze this radiology report and generate structured medical recommendations:
+    {analysis_text}
+
+    Provide recommendations in this exact JSON format:
+    {{
+        "medications": [
+            {{
+                "name": "Medication Name",
+                "dosage": "Dosage information",
+                "purpose": "Therapeutic purpose"
+            }}
+        ],
+        "treatments": ["Treatment option 1", "Treatment option 2"],
+        "precautions": ["Important precaution 1", "Important precaution 2"],
+        "follow_up": ["Follow-up action 1", "Follow-up action 2"]
+    }}
+
+    Follow these guidelines:
+    1. Use only medications appropriate for the condition
+    2. Consider patient safety and contraindications
+    3. Include both immediate and long-term actions
+    4. Base recommendations on latest medical guidelines
+    5. Use realistic dosages and administration frequencies
+    """
+
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            json={
+                "model": "llama-3-70b-8192",
+                "messages": [
+                    {"role": "system", "content": "You are a medical recommendation system. Generate structured treatment recommendations based on radiology findings."},
+                    {"role": "user", "content": recommendation_prompt}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.3,
+                "max_tokens": 1000
+            },
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            logger.error(f"Recommendation API error: {response.text}")
+            return {}
+
+        result = response.json()
+        recommendations = json.loads(result["choices"][0]["message"]["content"])
+        return recommendations
+
+    except Exception as e:
+        logger.error(f"Recommendation generation failed: {str(e)}")
+        return {}
+
+@app.post("/upload_and_query")
+async def upload_and_query(image: UploadFile = File(...), query: str = Form(...)):
+    try:
+        # Process image
+        image_content = await image.read()
+        encoded_image = base64.b64encode(image_content).decode("utf-8")
+
+        # Verify image
+        try:
+            img = Image.open(io.BytesIO(image_content))
+            img.verify()
+        except Exception as e:
+            logger.error(f"Invalid image: {str(e)}")
+            raise HTTPException(400, detail="Invalid image format")
+
+        # Get initial analysis
+        analysis_response = requests.post(
+            GROQ_API_URL,
+            json={
+                "model": "llama-3.2-11b-vision-preview",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": query},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}}
+                    ]
+                }],
+                "max_tokens": 1000
+            },
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            timeout=30
+        )
+
+        if analysis_response.status_code != 200:
+            raise HTTPException(500, detail="Analysis failed")
+
+        # Process analysis
+        analysis_result = analysis_response.json()
+        analysis_text = analysis_result["choices"][0]["message"]["content"]
+        
+        # Generate recommendations
+        recommendations = generate_recommendations(analysis_text)
+
+        return JSONResponse({
+            "analysis": analysis_text,
+            "recommendations": recommendations
+        })
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(500, detail="Processing error")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, port=8000)
